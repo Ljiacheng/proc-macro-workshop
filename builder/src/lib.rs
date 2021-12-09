@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use syn::spanned::Spanned;
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let st = syn::parse_macro_input!(input as syn::DeriveInput);
     match do_expand(&st) {
@@ -31,10 +31,30 @@ fn generate_builder_struct_fields_def(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let fields = get_fields_from_derive_input(&st)?;
     let idents: Vec<_> = fields.iter().map(|f| &f.ident).collect();
-    let types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    let types: syn::Result<Vec<_>> = fields
+        .iter()
+        .map(|f| {
+            if let Some(inner_type) = get_generic_inner_type(&f.ty, "Option") {
+                Ok(quote::quote! {
+                    std::option::Option<#inner_type>
+                })
+            } else if get_user_specified_ident_for_vec(f)?.is_some() {
+                let origin_type = &f.ty;
+                Ok(quote::quote! {
+                    #origin_type
+                })
+            } else {
+                let origin_type = &f.ty;
+                Ok(quote::quote! {
+                    std::option::Option<#origin_type>
+                })
+            }
+        })
+        .collect();
 
+    let types = types?;
     let ret = quote::quote! {
-        #(#idents: std::option::Option<#types>),*
+        #(#idents: #types),*
     };
 
     Ok(ret)
@@ -44,16 +64,22 @@ fn generate_builder_struct_factory_init_clauses(
     st: &syn::DeriveInput,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let fields = get_fields_from_derive_input(&st)?;
-    let init_clause = fields
+    let init_clause: syn::Result<Vec<_>> = fields
         .iter()
         .map(|f| {
             let ident = &f.ident;
-            quote::quote! {
-                #ident: std::option::Option::None
+            if get_user_specified_ident_for_vec(&f)?.is_some() {
+                Ok(quote::quote! {
+                    #ident: std::vec::Vec::new()
+                })
+            } else {
+                Ok(quote::quote! {
+                    #ident: std::option::Option::None
+                })
             }
         })
         .collect();
-    Ok(init_clause)
+    Ok(init_clause?)
 }
 
 fn generate_setter_functions(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -62,15 +88,156 @@ fn generate_setter_functions(st: &syn::DeriveInput) -> syn::Result<proc_macro2::
     let types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
     let mut final_tokenstream = proc_macro2::TokenStream::new();
-    for (ident, type_) in idents.iter().zip(types.iter()) {
-        let token_stream_piece = quote::quote! {
-            fn #ident(&mut self, #ident: #type_) -> &mut Self {
-                self.#ident = std::option::Option::Some(#ident);
+    for (idx, (ident, type_)) in idents.iter().zip(types.iter()).enumerate() {
+        let token_stream_piece = if let Some(inner_type) = get_generic_inner_type(type_, "Option") {
+            quote::quote! {
+                fn #ident(&mut self, #ident: #inner_type) -> &mut Self {
+                    self.#ident = std::option::Option::Some(#ident);
+                    self
+                }
+            }
+        } else if let Some(ref user_specified_ident) =
+            get_user_specified_ident_for_vec(&fields[idx])?
+        {
+            let inner_type = get_generic_inner_type(type_, "Vec").ok_or(syn::Error::new(
+                fields[idx].span(),
+                "'each' field must be a Vec type",
+            ))?;
+            let mut token_stream_piece = quote::quote! {
+                fn #user_specified_ident(&mut self, #user_specified_ident: #inner_type) -> &mut Self {
+                    self.#ident.push(#user_specified_ident);
+                    self
+                }
+            };
+
+            if user_specified_ident != ident.as_ref().unwrap() {
+                token_stream_piece.extend(quote::quote! {
+                    fn #ident(&mut self, #ident: #type_) -> &mut Self {
+                        self.#ident = #ident.clone();
+                        self
+                    }
+                })
+            }
+            token_stream_piece
+        } else {
+            quote::quote! {
+                fn #ident(&mut self, #ident: #type_) -> &mut Self {
+                    self.#ident = std::option::Option::Some(#ident);
+                    self
+                }
             }
         };
         final_tokenstream.extend(token_stream_piece);
     }
     Ok(final_tokenstream)
+}
+
+fn get_generic_inner_type<'a>(ty: &'a syn::Type, outer_ident_name: &str) -> Option<&'a syn::Type> {
+    if let syn::Type::Path(syn::TypePath { ref path, .. }) = ty {
+        // 这里我们取segments的最后一节来判断是不是`T<U>`，这样如果用户写的是`foo:bar::T<U>`我们也能识别出最后的`T<U>`
+        if let Some(seg) = path.segments.last() {
+            if seg.ident == outer_ident_name {
+                if let syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
+                    ref args,
+                    ..
+                }) = seg.arguments
+                {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.first() {
+                        return Some(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn generate_build_function(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let fields = get_fields_from_derive_input(&st)?;
+    let types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+
+    let mut check_code_pieces = Vec::new();
+    for idx in 0..fields.len() {
+        let ident = &fields[idx].ident;
+        if get_generic_inner_type(types[idx], "Option").is_none()
+            && get_user_specified_ident_for_vec(&fields[idx])?.is_none()
+        {
+            check_code_pieces.push(quote::quote! {
+                if self.#ident.is_none() {
+                    let err = format!("{} field is missing", stringify!(#ident));
+                    return std::result::Result::Err(err.into());
+                }
+            });
+        }
+    }
+
+    let mut fill_result_clauses = Vec::new();
+    for idx in 0..fields.len() {
+        let ident = &fields[idx].ident;
+        if get_user_specified_ident_for_vec(&fields[idx])?.is_some() {
+            fill_result_clauses.push(quote::quote! {
+                #ident: self.#ident.clone()
+            });
+        } else if get_generic_inner_type(&types[idx], "Option").is_none() {
+            fill_result_clauses.push(quote::quote! {
+                #ident: self.#ident.clone().unwrap()
+            });
+        } else {
+            fill_result_clauses.push(quote::quote! {
+                #ident: self.#ident.clone()
+            });
+        }
+    }
+
+    let original_struct_ident = &st.ident;
+    let token_stream = quote::quote! {
+        pub fn build(&mut self) -> std::result::Result<#original_struct_ident, std::boxed::Box<dyn std::error::Error>> {
+            #(#check_code_pieces)*
+
+            let ret = #original_struct_ident {
+                #(#fill_result_clauses),*
+            };
+
+            Ok(ret)
+        }
+
+    };
+
+    Ok(token_stream)
+}
+
+fn get_user_specified_ident_for_vec(field: &syn::Field) -> syn::Result<Option<syn::Ident>> {
+    for attr in &field.attrs {
+        if let Ok(syn::Meta::List(syn::MetaList {
+            ref path,
+            ref nested,
+            ..
+        })) = attr.parse_meta()
+        {
+            if let Some(p) = path.segments.first() {
+                if p.ident == "builder" {
+                    if let Some(syn::NestedMeta::Meta(syn::Meta::NameValue(kv))) = nested.first() {
+                        if kv.path.is_ident("each") {
+                            if let syn::Lit::Str(ref ident_str) = kv.lit {
+                                return Ok(Some(syn::Ident::new(
+                                    ident_str.value().as_str(),
+                                    attr.span(),
+                                )));
+                            }
+                        } else {
+                            if let Ok(syn::Meta::List(ref list)) = attr.parse_meta() {
+                                return Err(syn::Error::new_spanned(
+                                    list,
+                                    r#"expected `builder(each = "...")`"#,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -83,6 +250,7 @@ fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let builder_struct_field_def = generate_builder_struct_fields_def(&st)?;
     let builder_struct_factory_init_clauses = generate_builder_struct_factory_init_clauses(&st)?;
     let setter_functions = generate_setter_functions(&st)?;
+    let generated_build_function = generate_build_function(&st)?;
 
     let ret = quote::quote!(
         pub struct #builder_name_ident {
@@ -99,6 +267,8 @@ fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
         impl #builder_name_ident {
             #setter_functions
+
+            #generated_build_function
         }
     );
 
