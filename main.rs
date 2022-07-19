@@ -6,18 +6,16 @@
 // To run the code:
 //     $ cargo run
 
-use derive_builder::Builder;
+use seq::seq;
 
-#[derive(Builder)]
-pub struct Command {
-    executable: String,
-    args: Vec<String>,
-    env: Vec<String>,
-    current_dir: String,
+macro_rules! expand_to_nothing {
+    ($arg:literal) => {
+        // nothing
+    };
 }
 
-fn main() {
-    let builder = Command::builder();
+seq!(N in 0..4 {
+    expand_to_nothing!(N);
+});
 
-    let _ = builder;
-}
+fn main() {}
